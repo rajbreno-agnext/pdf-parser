@@ -320,8 +320,66 @@ def convert_to_excel(json_data):
         st.error(f"Error converting to Excel: {str(e)}")
         return None
 
+def load_saved_settings():
+    """Load saved settings from local file"""
+    settings_file = Path("settings.json")
+    if settings_file.exists():
+        try:
+            with open(settings_file, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {"api_key": "", "custom_prompt": ""}
+    return {"api_key": "", "custom_prompt": ""}
+
+def save_settings(api_key="", custom_prompt=""):
+    """Save settings to local file"""
+    settings_file = Path("settings.json")
+    try:
+        settings = {
+            "api_key": api_key,
+            "custom_prompt": custom_prompt
+        }
+        with open(settings_file, "w") as f:
+            json.dump(settings, f)
+    except Exception as e:
+        st.error(f"Error saving settings: {str(e)}")
+
+def clear_settings(clear_api=False, clear_prompt=False):
+    """Clear specified settings and session state"""
+    try:
+        settings_file = Path("settings.json")
+        current_settings = {}
+        
+        # Load current settings if file exists
+        if settings_file.exists():
+            try:
+                with open(settings_file, "r") as f:
+                    current_settings = json.load(f)
+            except:
+                pass
+        
+        # Update settings based on what needs to be cleared
+        if clear_api:
+            current_settings["api_key"] = ""
+            st.session_state.api_key = ""
+        if clear_prompt:
+            current_settings["custom_prompt"] = ""
+            st.session_state.custom_prompt = ""
+        
+        # Save updated settings
+        with open(settings_file, "w") as f:
+            json.dump(current_settings, f)
+        
+        return True
+    except Exception as e:
+        st.error(f"Error clearing settings: {str(e)}")
+        return False
+
 def main():
     st.set_page_config(page_title="AgNext X Gemini Flash 2.0", layout="wide")
+    
+    # Load saved settings
+    saved_settings = load_saved_settings()
     
     # Initialize session state for storing results, API key, and custom prompt
     if 'merged_json' not in st.session_state:
@@ -329,9 +387,13 @@ def main():
     if 'df' not in st.session_state:
         st.session_state.df = None
     if 'api_key' not in st.session_state:
-        st.session_state.api_key = os.getenv("GEMINI_API_KEY", "")
+        st.session_state.api_key = saved_settings.get("api_key", "") or os.getenv("GEMINI_API_KEY", "")
     if 'custom_prompt' not in st.session_state:
-        st.session_state.custom_prompt = ""
+        st.session_state.custom_prompt = saved_settings.get("custom_prompt", "")
+    if 'show_tabs' not in st.session_state:
+        st.session_state.show_tabs = False
+    if 'current_tab' not in st.session_state:
+        st.session_state.current_tab = "JSON"
     
     # Custom CSS for title styling
     st.markdown("""
@@ -487,6 +549,21 @@ def main():
             margin-bottom: 1rem !important;
             box-shadow: 0 2px 4px rgba(0,0,0,0.05) !important;
         }
+        /* Results container spacing */
+        .results-spacing {
+            margin-bottom: 2rem;
+            padding: 1rem;
+        }
+        
+        /* Tab container spacing */
+        .stTabs {
+            margin-top: 0rem;
+        }
+        
+        /* Process button bottom margin */
+        div[data-testid="stButton"] button[kind="primary"] {
+            margin-bottom: 3rem !important;
+        }
         </style>
         <h1 class="title">🚀 AgNext X Gemini Flash 2.0 PDF Parser</h1>
     """, unsafe_allow_html=True)
@@ -497,7 +574,7 @@ def main():
     with st.expander("Add Gemini API Key"):
         container = st.container()
         with container:
-            col1, col2 = st.columns([20, 1])
+            col1, col2, col3 = st.columns([18, 1, 1])
             with col1:
                 api_key_input = st.text_input(
                     "Enter API Key",
@@ -509,15 +586,20 @@ def main():
             with col2:
                 if st.button("✓", key="api_key_check", help="Apply API Key"):
                     st.session_state.api_key = api_key_input
-                    # Don't clear these states when just updating API key
-                    if 'uploaded_file_info' not in st.session_state:
-                        st.session_state.merged_json = None
-                        st.session_state.df = None
+                    save_settings(
+                        api_key=api_key_input,
+                        custom_prompt=st.session_state.custom_prompt
+                    )
+            with col3:
+                if st.button("🗑️", key="clear_api_key", help="Clear API Key"):
+                    if clear_settings(clear_api=True):
+                        st.success("API Key cleared!")
+                        st.rerun()
 
     # Custom prompt input section without expander
     container = st.container()
     with container:
-        col1, col2 = st.columns([20, 1])
+        col1, col2, col3 = st.columns([18, 1, 1])
         with col1:
             custom_prompt = st.text_area(
                 "Additional Instructions",
@@ -528,10 +610,15 @@ def main():
         with col2:
             if st.button("✓", key="apply_instructions", help="Apply Instructions"):
                 st.session_state.custom_prompt = custom_prompt
-                # Don't clear these states when just updating instructions
-                if 'uploaded_file_info' not in st.session_state:
-                    st.session_state.merged_json = None
-                    st.session_state.df = None
+                save_settings(
+                    api_key=st.session_state.api_key,
+                    custom_prompt=custom_prompt
+                )
+        with col3:
+            if st.button("🗑️", key="clear_instructions", help="Clear Instructions"):
+                if clear_settings(clear_prompt=True):
+                    st.success("Instructions cleared!")
+                    st.rerun()
 
     # Add checkbox for multi-sheet option before file upload
     use_multi_sheet = st.checkbox("Split different tables into separate sheets", 
@@ -606,62 +693,105 @@ def main():
             
             # Display results if available
             if st.session_state.merged_json:
+                # Add vertical spacing
+                st.markdown("<div class='results-spacing'></div>", unsafe_allow_html=True)
+                
                 # Create tabs for JSON and Spreadsheet views
-                tab1, tab2 = st.tabs(["📊 JSON View", "📈 Spreadsheet View"])
-                
-                # JSON Tab
-                with tab1:
-                    st.json(st.session_state.merged_json)
-                    if st.download_button(
-                        label="⬇️ Download JSON",
-                        data=json.dumps(st.session_state.merged_json, indent=2),
-                        file_name="parsed_data.json",
-                        mime="application/json",
-                        use_container_width=True
-                    ):
-                        st.session_state.current_tab = "JSON"
-                
-                # Spreadsheet Tab
-                with tab2:
-                    if use_multi_sheet:
-                        # Convert to Excel with multiple sheets
-                        excel_buffer = convert_to_excel(st.session_state.merged_json)
-                        if excel_buffer:
-                            st.dataframe(
-                                st.session_state.df,
+                results_container = st.container()
+                with results_container:
+                    # Add section header with spacing
+                    st.markdown("### 📊 Results")
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    
+                    # Create tabs
+                    tab1, tab2 = st.tabs(["📊 JSON View", "📈 Spreadsheet View"])
+                    
+                    # JSON Tab
+                    with tab1:
+                        st.json(st.session_state.merged_json)
+                        col1, col2 = st.columns([6, 4])
+                        with col1:
+                            st.download_button(
+                                label="⬇️ Download JSON",
+                                data=json.dumps(st.session_state.merged_json, indent=2),
+                                file_name="parsed_data.json",
+                                mime="application/json",
                                 use_container_width=True,
-                                height=400
+                                key="json_download"
                             )
-                            if st.download_button(
-                                label="⬇️ Download Excel",
-                                data=excel_buffer,
-                                file_name="parsed_data.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                use_container_width=True
-                            ):
-                                st.session_state.current_tab = "Spreadsheet"
-                    else:
-                        # Use existing CSV conversion
-                        if st.session_state.df is not None:
-                            st.dataframe(
-                                st.session_state.df,
-                                use_container_width=True,
-                                height=400
-                            )
-                            if st.download_button(
-                                label="⬇️ Download CSV",
-                                data=st.session_state.df.to_csv(index=False),
-                                file_name="parsed_data.csv",
-                                mime="text/csv",
-                                use_container_width=True
-                            ):
-                                st.session_state.current_tab = "Spreadsheet"
+                    
+                    # Spreadsheet Tab
+                    with tab2:
+                        if use_multi_sheet:
+                            # Convert to Excel with multiple sheets
+                            excel_buffer = convert_to_excel(st.session_state.merged_json)
+                            if excel_buffer:
+                                # Create separate dataframes for each table
+                                table_dfs = {}
+                                if isinstance(st.session_state.merged_json, dict) and 'data' in st.session_state.merged_json:
+                                    for table in st.session_state.merged_json['data']:
+                                        table_name = table.get('table', 'Sheet')
+                                        rows = table.get('rows', [])
+                                        if rows:
+                                            # Create DataFrame for this table
+                                            df = pd.DataFrame(rows)
+                                            # Remove 'Table' column if it exists
+                                            if 'Table' in df.columns:
+                                                df = df.drop('Table', axis=1)
+                                            table_dfs[table_name] = df
+                                
+                                if table_dfs:
+                                    # Create a selector for different tables
+                                    st.markdown("### 📑 Select Table to View")
+                                    selected_table = st.selectbox(
+                                        "Choose a table to view",
+                                        options=list(table_dfs.keys()),
+                                        label_visibility="collapsed"
+                                    )
+                                    
+                                    # Show the selected table
+                                    st.markdown(f"**{selected_table}**")
+                                    st.dataframe(
+                                        table_dfs[selected_table],
+                                        use_container_width=True,
+                                        height=400
+                                    )
+                                
+                                col1, col2 = st.columns([6, 4])
+                                with col1:
+                                    st.download_button(
+                                        label="⬇️ Download Excel",
+                                        data=excel_buffer,
+                                        file_name="parsed_data.xlsx",
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        use_container_width=True,
+                                        key="excel_download"
+                                    )
+                        else:
+                            # Use existing CSV conversion
+                            if st.session_state.df is not None:
+                                st.dataframe(
+                                    st.session_state.df,
+                                    use_container_width=True,
+                                    height=400
+                                )
+                                col1, col2 = st.columns([6, 4])
+                                with col1:
+                                    st.download_button(
+                                        label="⬇️ Download CSV",
+                                        data=st.session_state.df.to_csv(index=False),
+                                        file_name="parsed_data.csv",
+                                        mime="text/csv",
+                                        use_container_width=True,
+                                        key="csv_download"
+                                    )
     else:
         # Clear session state when no file is uploaded
         if 'uploaded_file_info' in st.session_state:
             del st.session_state.uploaded_file_info
         st.session_state.merged_json = None
         st.session_state.df = None
+        st.session_state.show_tabs = False
 
 if __name__ == "__main__":
     main() 
