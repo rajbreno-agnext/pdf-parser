@@ -256,16 +256,23 @@ async def merge_with_gemini(results, model):
         prompt = f"""
         Merge these JSON results from different pages into a single coherent JSON structure.
         Follow these guidelines strictly:
-        1. Create a consistent table structure
-        2. Each table should have:
-           - A clear table name
-           - Consistent column names across rows
+        1. Combine similar tables into a single table:
+           - Tables with similar names should be merged (e.g., "Test Results - Part 1", "Test Results - Part 2")
+           - Remove part numbers or suffixes when merging table names
+           - Combine all rows from similar tables while maintaining data integrity
+           - Ensure consistent column names across merged rows
+
+        2. Each final table should have:
+           - A clear, consolidated table name (e.g., "Test Results (Pesticides Residues)")
+           - Consistent column names across all rows
            - Simple data types (strings, numbers) for values
+           - All data from the original tables preserved
+
         3. Return the data in this exact format:
         {{
             "data": [
                 {{
-                    "table": "Table Name",
+                    "table": "Consolidated Table Name",
                     "rows": [
                         {{"column1": "value1", "column2": "value2", ...}},
                         {{"column1": "value3", "column2": "value4", ...}}
@@ -273,6 +280,11 @@ async def merge_with_gemini(results, model):
                 }}
             ]
         }}
+
+        Important:
+        - Merge tables that contain "Test Results" in their names into a single table
+        - Keep Quality Characteristics and other distinct tables separate
+        - Ensure no data is lost during merging
 
         Input JSON array to merge:
         {json_str}
