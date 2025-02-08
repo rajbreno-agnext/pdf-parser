@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 import asyncio
 import time
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from openpyxl import Workbook
 import io
@@ -20,7 +21,7 @@ load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # Gemini model configuration
-GENERATION_CONFIG = {
+PARSING_CONFIG = {
     "temperature": 1,
     "top_p": 0.95,
     "top_k": 40,
@@ -28,11 +29,19 @@ GENERATION_CONFIG = {
     "response_mime_type": "application/json",
 }
 
-def initialize_gemini_model():
+MERGING_CONFIG = {
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "top_k": 64,
+    "max_output_tokens": 65536,
+    "response_mime_type": "text/plain",
+}
+
+def initialize_gemini_model(model_name="gemini-2.0-flash", for_merging=False):
     """Initialize and return the Gemini model"""
     return genai.GenerativeModel(
-        model_name="gemini-2.0-flash",
-        generation_config=GENERATION_CONFIG,
+        model_name=model_name,
+        generation_config=MERGING_CONFIG if for_merging else PARSING_CONFIG,
     )
 
 def split_pdf_to_pages(pdf_file):
@@ -60,43 +69,37 @@ def split_pdf_to_pages(pdf_file):
 async def process_page(page_path, model, page_num, progress_bar, status_text):
     """Process a single PDF page"""
     try:
+        start_time = time.time()
+        
         # Upload to Gemini
         gemini_file = genai.upload_file(page_path, mime_type="application/pdf")
         
+        # Create base prompt
+        base_prompt = "Parse this PDF page into structured JSON format. Include all relevant information."
+        
+        # Add custom instructions if provided
+        if st.session_state.custom_prompt:
+            prompt = f"{base_prompt}\n\nAdditional Instructions:\n{st.session_state.custom_prompt}"
+        else:
+            prompt = base_prompt
+        
         # Start chat session
         chat = model.start_chat()
-        response = chat.send_message([
-            gemini_file,
-            """Parse this PDF page into structured JSON format. Follow these guidelines:
-            1. Organize data into clear tables with consistent column names
-            2. Each table should have:
-               - A clear table name
-               - Consistent column headers
-               - Rows with corresponding values
-            3. Use simple data types (strings, numbers) for values
-            4. Maintain data in a tabular format
-            5. Ensure all related data is grouped together
-            
-            Return the data in this structure:
-            {
-                "data": [
-                    {
-                        "table": "Table Name",
-                        "headers": ["column1", "column2", ...],
-                        "rows": [
-                            {"column1": "value1", "column2": "value2", ...},
-                            ...
-                        ]
-                    },
-                    ...
-                ]
-            }"""
-        ])
+        
+        # Show that we're starting this page with timestamp
+        status_text.text(f"🔄 Started page {page_num + 1} at {time.strftime('%H:%M:%S')}")
+        
+        response = chat.send_message([gemini_file, prompt])
+        
+        end_time = time.time()
+        processing_time = end_time - start_time
         
         # Update progress
         if progress_bar and status_text:
-            progress_bar.progress((page_num + 1) / progress_bar.total_pages)
-            status_text.text(f"Processed page {page_num + 1}/{progress_bar.total_pages}")
+            current = getattr(progress_bar, 'current_count', 0) + 1
+            setattr(progress_bar, 'current_count', current)
+            progress_bar.progress(current / progress_bar.total_pages)
+            status_text.text(f"✅ Page {page_num + 1} done in {processing_time:.1f}s (Total: {current}/{progress_bar.total_pages})")
         
         return json.loads(response.text)
     except Exception as e:
@@ -104,21 +107,151 @@ async def process_page(page_path, model, page_num, progress_bar, status_text):
         return None
 
 async def process_pages_parallel(page_paths, model, progress_bar, status_text):
-    """Process multiple pages in parallel"""
-    tasks = []
-    for i, page_path in enumerate(page_paths):
-        task = asyncio.create_task(process_page(page_path, model, i, progress_bar, status_text))
-        tasks.append(task)
+    """Process multiple pages in parallel using separate sessions"""
+    print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Starting parallel processing for {len(page_paths)} pages")
     
+    # Initialize progress tracking
+    setattr(progress_bar, 'current_count', 0)
+    progress_bar.total_pages = len(page_paths)
+    
+    # Pre-initialize all files and sessions
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Beginning session initialization")
+    status_text.text(f"⚡ Initializing {len(page_paths)} parallel sessions...")
+    sessions = []
+    
+    # Initialize all sessions first
+    for page_num, page_path in enumerate(page_paths, 1):
+        try:
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Initializing session for page {page_num}")
+            # Upload file and create chat session
+            gemini_file = genai.upload_file(page_path, mime_type="application/pdf")
+            chat = model.start_chat()
+            sessions.append((gemini_file, chat, page_path))
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Session initialized for page {page_num}")
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Error initializing session for page {page_num}: {str(e)}")
+            st.error(f"Error initializing session for page {page_num}: {str(e)}")
+    
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] All sessions initialized")
+    
+    # Create base prompt
+    base_prompt = """Parse this PDF page into structured JSON format. Follow these strict guidelines:
+1. Ensure all text values are properly escaped JSON strings
+2. Remove any line breaks or special characters within text values
+3. Use simple data types: strings, numbers, or boolean values only
+4. Avoid nested objects deeper than 2 levels
+5. If a field might contain quotes or special characters, properly escape them
+6. Format all dates as ISO strings (YYYY-MM-DD)
+7. Return only valid JSON that can be parsed by standard JSON parsers
+
+Expected format:
+{
+    "field1": "value1",
+    "field2": 123,
+    "field3": "2024-03-21",
+    "table_data": [
+        {"column1": "value1", "column2": "value2"}
+    ]
+}"""
+    if st.session_state.custom_prompt:
+        prompt = f"{base_prompt}\n\nAdditional Instructions:\n{st.session_state.custom_prompt}"
+    else:
+        prompt = base_prompt
+    
+    # Process function that runs in a separate thread
+    def process_single_page(session_data, prompt, page_num):
+        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Thread starting processing for page {page_num}")
+        gemini_file, chat, _ = session_data
+        response = chat.send_message([gemini_file, prompt])
+        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Thread completed processing for page {page_num}")
+        return response.text
+    
+    # Async wrapper for processing
+    async def process_with_session(session_data, page_num):
+        try:
+            # Log the exact start time
+            current_time = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            print(f"[{current_time}] Starting async task for page {page_num + 1}")
+            status_text.text(f"🚀 Page {page_num + 1} started at {current_time}")
+            
+            # Run the API call in a thread pool
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Dispatching page {page_num + 1} to thread pool")
+            response_text = await asyncio.to_thread(process_single_page, session_data, prompt, page_num + 1)
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Thread pool completed for page {page_num + 1}")
+            
+            # Update progress
+            current = getattr(progress_bar, 'current_count', 0) + 1
+            setattr(progress_bar, 'current_count', current)
+            progress_bar.progress(current / progress_bar.total_pages)
+            status_text.text(f"✅ Page {page_num + 1} done (Total: {current}/{progress_bar.total_pages})")
+            
+            return json.loads(response_text)
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Error processing page {page_num + 1}: {str(e)}")
+            st.error(f"Error processing page {page_num + 1}: {str(e)}")
+            return None
+    
+    # Create all tasks
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Creating all tasks")
+    current_time = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    status_text.text(f"🚀 Starting all {len(sessions)} pages simultaneously at {current_time}")
+    
+    # Create and start all tasks at once
+    tasks = [asyncio.create_task(process_with_session(session, i)) for i, session in enumerate(sessions)]
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Created {len(tasks)} tasks, waiting for completion")
+    
+    # Wait for all tasks to complete
     results = await asyncio.gather(*tasks)
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] All tasks completed")
+    
     return results
 
 async def merge_with_gemini(results, model):
     """Merge JSON results using Gemini API"""
     try:
-        # Convert results to a formatted string
-        json_str = json.dumps(results, indent=2)
-        
+        # Debug: Log the raw results
+        print("\n[DEBUG] Raw results before merging:")
+        for i, result in enumerate(results, 1):
+            print(f"\n[DEBUG] Page {i} result type: {type(result)}")
+            print(f"[DEBUG] Page {i} result content:")
+            print(result)
+            if result is None:
+                print(f"[DEBUG] Warning: Page {i} returned None")
+                continue
+            try:
+                # Verify each result can be serialized
+                json.dumps(result)
+                print(f"[DEBUG] Page {i} is valid JSON")
+            except Exception as e:
+                print(f"[DEBUG] Page {i} has invalid JSON: {str(e)}")
+
+        # Filter out None values and attempt to clean results
+        cleaned_results = []
+        for i, result in enumerate(results, 1):
+            if result is not None:
+                try:
+                    if isinstance(result, str):
+                        # Try to parse if it's a string
+                        parsed = json.loads(result)
+                        cleaned_results.append(parsed)
+                        print(f"[DEBUG] Page {i}: Successfully parsed string to JSON")
+                    else:
+                        # If it's already a dict/list, verify it can be serialized
+                        json.dumps(result)
+                        cleaned_results.append(result)
+                        print(f"[DEBUG] Page {i}: Valid JSON object")
+                except Exception as e:
+                    print(f"[DEBUG] Page {i}: Skipped due to error: {str(e)}")
+                    continue
+
+        # Convert cleaned results to a formatted string
+        try:
+            json_str = json.dumps(cleaned_results, indent=2)
+            print("\n[DEBUG] Successfully serialized cleaned results")
+        except Exception as e:
+            print(f"[DEBUG] Error serializing cleaned results: {str(e)}")
+            raise
+
         # Create prompt for merging
         prompt = f"""
         Merge these JSON results from different pages into a single coherent JSON structure.
@@ -140,18 +273,38 @@ async def merge_with_gemini(results, model):
                 }}
             ]
         }}
-        
-        Input JSON array:
+
+        Input JSON array to merge:
         {json_str}
         """
         
-        # Get merged result from Gemini
-        chat = model.start_chat()
+        # Get merged result from Gemini using the thinking model
+        merge_model = initialize_gemini_model("gemini-2.0-flash-thinking-exp-01-21", for_merging=True)
+        chat = merge_model.start_chat()
         response = chat.send_message(prompt)
         
-        # Parse and return the merged JSON
-        return json.loads(response.text)
+        print("\n[DEBUG] Gemini merge response:")
+        print(response.text)
+        
+        try:
+            # Extract JSON from the response text
+            json_text = response.text
+            if "```json" in json_text and "```" in json_text:
+                # Extract the JSON part between the backticks
+                json_text = json_text.split("```json")[1].split("```")[0].strip()
+            
+            # Parse and return the merged JSON
+            merged_json = json.loads(json_text)
+            print("[DEBUG] Successfully parsed merged JSON")
+            return merged_json
+        except Exception as e:
+            print(f"[DEBUG] Error parsing merged JSON: {str(e)}")
+            print("[DEBUG] Response text that caused error:")
+            print(response.text)
+            raise
+            
     except Exception as e:
+        print(f"[DEBUG] Final error in merge_with_gemini: {str(e)}")
         st.error(f"Error merging results: {str(e)}")
         return None
 
@@ -241,40 +394,6 @@ def cleanup_temp_files(file_paths):
         os.rmdir(os.path.dirname(file_paths[0]))
     except Exception:
         pass
-
-# Modify the process_page function to include custom prompt
-async def process_pages_with_custom_prompt(page_paths, model, progress_bar, status_text):
-    """Process multiple pages in parallel with custom prompt"""
-    tasks = []
-    for i, page_path in enumerate(page_paths):
-        try:
-            gemini_file = genai.upload_file(page_path, mime_type="application/pdf")
-            
-            # Create base prompt
-            base_prompt = "Parse this PDF page into structured JSON format. Include all relevant information."
-            
-            # Add custom instructions if provided
-            if st.session_state.custom_prompt:
-                prompt = f"{base_prompt}\n\nAdditional Instructions:\n{st.session_state.custom_prompt}"
-            else:
-                prompt = base_prompt
-            
-            # Start chat session
-            chat = model.start_chat()
-            response = chat.send_message([gemini_file, prompt])
-            
-            # Update progress
-            if progress_bar and status_text:
-                progress_bar.progress((i + 1) / progress_bar.total_pages)
-                status_text.text(f"Processed page {i + 1}/{progress_bar.total_pages}")
-            
-            result = json.loads(response.text)
-            tasks.append(result)
-        except Exception as e:
-            st.error(f"Error processing page {i + 1}: {str(e)}")
-            tasks.append(None)
-    
-    return tasks
 
 def convert_to_excel(json_data):
     """Convert JSON data to Excel format with multiple sheets"""
@@ -675,9 +794,9 @@ def main():
                 page_paths, total_pages = split_pdf_to_pages(uploaded_file)
                 
                 try:
-                    # Process pages with custom prompt
+                    # Process pages in parallel with separate sessions
                     with st.spinner("⚡ Processing pages in parallel..."):
-                        results = asyncio.run(process_pages_with_custom_prompt(page_paths, model, progress_bar, status_text))
+                        results = asyncio.run(process_pages_parallel(page_paths, model, progress_bar, status_text))
                     
                     # Merge results using Gemini
                     with st.spinner("🔄 Merging results with AI..."):
