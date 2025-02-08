@@ -565,13 +565,13 @@ def main():
             margin-bottom: 3rem !important;
         }
         </style>
-        <h1 class="title">🚀 AgNext X Gemini Flash 2.0 PDF Parser</h1>
+        <h1 class="title">AgNext PDF Parser</h1>
     """, unsafe_allow_html=True)
     
-    st.markdown('<p class="upload-text">Upload your PDF file to convert it into structured JSON and CSV formats.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="upload-text">Powered by Gemini 2.0 Flash</p>', unsafe_allow_html=True)
     
     # API Key input section with expander
-    with st.expander("Add Gemini API Key"):
+    with st.expander("🔑 Add Gemini API Key"):
         container = st.container()
         with container:
             col1, col2, col3 = st.columns([18, 1, 1])
@@ -666,7 +666,7 @@ def main():
             st.markdown(f'<div class="file-info">Total pages: {total_pages}</div>', unsafe_allow_html=True)
         
         # Process button
-        if st.button("🚀 Process PDF", use_container_width=True, type="primary") or st.session_state.merged_json is not None:
+        if st.button("Process PDF", use_container_width=True, type="primary") or st.session_state.merged_json is not None:
             if st.session_state.merged_json is None:
                 progress_bar = st.progress(0)
                 progress_bar.total_pages = total_pages
