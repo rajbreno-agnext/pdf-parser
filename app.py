@@ -66,6 +66,20 @@ def split_pdf_to_pages(pdf_file):
     
     return page_paths, total_pages
 
+def create_progress_bar(progress, status, percentage):
+    """Create a progress bar with percentage and status"""
+    col1, col2, col3 = st.columns([2, 6, 2])
+    with col1:
+        st.markdown(f'<div class="progress-percentage">0%</div>', unsafe_allow_html=True)
+    with col2:
+        progress_bar = st.progress(0)
+    with col3:
+        st.markdown(f'<div class="progress-percentage">100%</div>', unsafe_allow_html=True)
+    
+    # Update progress and show current percentage
+    progress_bar.progress(progress, f"{status} ({percentage:.0f}%)")
+    return progress_bar
+
 async def process_page(page_path, model, page_num, progress_bar, status_text):
     """Process a single PDF page"""
     try:
@@ -116,7 +130,7 @@ async def process_pages_parallel(page_paths, model, progress_bar, status_text):
     
     # Pre-initialize all files and sessions
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Beginning session initialization")
-    status_text.text(f"⚡ Initializing {len(page_paths)} parallel sessions...")
+    progress_bar.progress(0.1, f"Initializing... (10%)")
     sessions = []
     
     # Initialize all sessions first
@@ -133,6 +147,7 @@ async def process_pages_parallel(page_paths, model, progress_bar, status_text):
             st.error(f"Error initializing session for page {page_num}: {str(e)}")
     
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] All sessions initialized")
+    progress_bar.progress(0.2, f"Processing... (20%)")
     
     # Create base prompt
     base_prompt = """Parse this PDF page into structured JSON format. Follow these strict guidelines:
@@ -172,7 +187,6 @@ Expected format:
             # Log the exact start time
             current_time = datetime.now().strftime("%H:%M:%S.%f")[:-3]
             print(f"[{current_time}] Starting async task for page {page_num + 1}")
-            status_text.text(f"🚀 Page {page_num + 1} started at {current_time}")
             
             # Run the API call in a thread pool
             print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Dispatching page {page_num + 1} to thread pool")
@@ -182,8 +196,9 @@ Expected format:
             # Update progress
             current = getattr(progress_bar, 'current_count', 0) + 1
             setattr(progress_bar, 'current_count', current)
-            progress_bar.progress(current / progress_bar.total_pages)
-            status_text.text(f"✅ Page {page_num + 1} done (Total: {current}/{progress_bar.total_pages})")
+            progress_percent = 0.2 + (0.6 * current / progress_bar.total_pages)
+            percentage = progress_percent * 100
+            progress_bar.progress(progress_percent, f"Processing... ({percentage:.0f}%)")
             
             return json.loads(response_text)
         except Exception as e:
@@ -193,8 +208,6 @@ Expected format:
     
     # Create all tasks
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Creating all tasks")
-    current_time = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    status_text.text(f"🚀 Starting all {len(sessions)} pages simultaneously at {current_time}")
     
     # Create and start all tasks at once
     tasks = [asyncio.create_task(process_with_session(session, i)) for i, session in enumerate(sessions)]
@@ -204,7 +217,107 @@ Expected format:
     results = await asyncio.gather(*tasks)
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] All tasks completed")
     
+    # Final progress update
+    progress_bar.progress(0.8, "Filtering... (80%)")
+    
     return results
+
+async def post_merge_validation(merged_json, model):
+    """Additional validation and consolidation of merged tables using Gemini thinking model"""
+    try:
+        # Convert merged JSON to string
+        json_str = json.dumps(merged_json, indent=2)
+        print("\n[DEBUG] Starting post-merge validation")
+        
+        # Create prompt for post-merge validation
+        prompt = f"""
+        Analyze and optimize this JSON structure by consolidating similar tables and removing insignificant data.
+        Follow these guidelines strictly:
+
+        1. Table Consolidation Rules:
+           - Combine tables with similar names or purposes into a single table
+           - Merge tables that share similar column structures
+           - Remove redundant "Sr No" or "S.No" columns and add a new sequential numbering
+           - Keep unique identifiers and test parameters intact
+
+        2. Table Quality and Filtering Rules:
+           - Remove tables that have only 1-2 rows unless they contain critical metadata
+           - Filter out tables that lack meaningful column structure
+           - Remove tables where more than 50% of cells are empty or null
+           - Exclude tables that don't provide significant analytical value
+           - Keep tables only if they contain actual tabular data (not just key-value pairs)
+           - Remove any row where only the first column has data and all other columns are empty/null
+           - Remove rows that are used only for section headers or subtotals
+
+        3. Similarity Criteria:
+           - Tables containing "Test Results" should be merged into one comprehensive table
+           - Tables with 70% or more matching columns should be consolidated
+           - Tables with similar prefixes or suffixes should be evaluated for merging
+           - If a table's content can be merged into another more comprehensive table, do so
+
+        4. Data Structure Requirements:
+           - Maintain data integrity during consolidation
+           - Ensure consistent column naming across merged tables
+           - Add a new "sequence_number" column starting from 0 for each table
+           - Remove any duplicate entries
+           - Standardize date formats and numerical values
+           - Ensure all retained tables have proper headers and consistent data types
+           - For merged tables, ensure sequence numbers are continuous starting from 0
+
+        5. Return the optimized data in this exact format:
+        {{
+            "data": [
+                {{
+                    "table": "Consolidated Table Name",
+                    "rows": [
+                        {{"sequence_number": 0, "parameter": "value1", "result": "value2", ...}},
+                        {{"sequence_number": 1, "parameter": "value3", "result": "value4", ...}}
+                    ]
+                }}
+            ]
+        }}
+
+        Important:
+        - Only keep tables that provide meaningful analytical value
+        - Ensure each table has sufficient rows to justify its existence
+        - Merge similar tables to create more comprehensive datasets
+        - Remove or merge tables that contain redundant or sparse information
+        - All sequence numbers must start from 0 and be continuous
+        - Remove any row where only the first column contains data
+        - Ensure no empty or header-only rows remain in the final output
+
+        Input JSON to optimize:
+        {json_str}
+        """
+        
+        # Get optimized result from Gemini using the thinking model
+        validation_model = initialize_gemini_model("gemini-2.0-flash-thinking-exp-01-21", for_merging=True)
+        chat = validation_model.start_chat()
+        response = chat.send_message(prompt)
+        
+        print("\n[DEBUG] Post-merge validation response:")
+        print(response.text)
+        
+        try:
+            # Extract JSON from the response text
+            json_text = response.text
+            if "```json" in json_text and "```" in json_text:
+                json_text = json_text.split("```json")[1].split("```")[0].strip()
+            
+            # Parse and return the optimized JSON
+            optimized_json = json.loads(json_text)
+            print("[DEBUG] Successfully parsed optimized JSON")
+            return optimized_json
+        except Exception as e:
+            print(f"[DEBUG] Error parsing optimized JSON: {str(e)}")
+            print("[DEBUG] Response text that caused error:")
+            print(response.text)
+            raise
+            
+    except Exception as e:
+        print(f"[DEBUG] Final error in post_merge_validation: {str(e)}")
+        st.error(f"Error in post-merge validation: {str(e)}")
+        return None
 
 async def merge_with_gemini(results, model):
     """Merge JSON results using Gemini API"""
@@ -302,15 +415,21 @@ async def merge_with_gemini(results, model):
             # Extract JSON from the response text
             json_text = response.text
             if "```json" in json_text and "```" in json_text:
-                # Extract the JSON part between the backticks
                 json_text = json_text.split("```json")[1].split("```")[0].strip()
             
-            # Parse and return the merged JSON
+            # Parse the merged JSON
             merged_json = json.loads(json_text)
             print("[DEBUG] Successfully parsed merged JSON")
-            return merged_json
+            
+            # Add post-merge validation
+            print("[DEBUG] Starting post-merge validation")
+            optimized_json = await post_merge_validation(merged_json, model)
+            
+            # Return optimized JSON if successful, otherwise return merged JSON
+            return optimized_json if optimized_json is not None else merged_json
+            
         except Exception as e:
-            print(f"[DEBUG] Error parsing merged JSON: {str(e)}")
+            print(f"[DEBUG] Error in merge processing: {str(e)}")
             print("[DEBUG] Response text that caused error:")
             print(response.text)
             raise
@@ -695,6 +814,31 @@ def main():
         div[data-testid="stButton"] button[kind="primary"] {
             margin-bottom: 3rem !important;
         }
+        
+        /* Progress bar container styling */
+        .stProgress {
+            margin-top: 3rem !important;
+            margin-bottom: 3rem !important;
+        }
+        .stProgress > div > div > div {
+            background-color: #d7ebff !important;
+        }
+        /* Progress label container */
+        .progress-container {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 0.5rem;
+        }
+        .progress-label {
+            font-size: 0.9rem;
+            color: #666;
+        }
+        .progress-percentage {
+            font-size: 0.9rem;
+            color: #0066cc;
+            font-weight: 500;
+        }
         </style>
         <h1 class="title">AgNext PDF Parser</h1>
     """, unsafe_allow_html=True)
@@ -799,7 +943,8 @@ def main():
         # Process button
         if st.button("Process PDF", use_container_width=True, type="primary") or st.session_state.merged_json is not None:
             if st.session_state.merged_json is None:
-                progress_bar = st.progress(0)
+                # Create progress bar with percentage display
+                progress_bar = create_progress_bar(0, "Starting", 0)
                 progress_bar.total_pages = total_pages
                 status_text = st.empty()
                 
@@ -807,20 +952,20 @@ def main():
                 
                 try:
                     # Process pages in parallel with separate sessions
-                    with st.spinner("⚡ Processing pages in parallel..."):
-                        results = asyncio.run(process_pages_parallel(page_paths, model, progress_bar, status_text))
+                    results = asyncio.run(process_pages_parallel(page_paths, model, progress_bar, status_text))
                     
                     # Merge results using Gemini
-                    with st.spinner("🔄 Merging results with AI..."):
-                        st.session_state.merged_json = asyncio.run(merge_with_gemini(results, model))
-                        if st.session_state.merged_json:
-                            st.session_state.df = convert_to_csv(st.session_state.merged_json)
+                    progress_bar.progress(0.9, "Filtering... (90%)")
+                    st.session_state.merged_json = asyncio.run(merge_with_gemini(results, model))
+                    if st.session_state.merged_json:
+                        st.session_state.df = convert_to_csv(st.session_state.merged_json)
+                    progress_bar.progress(1.0, "Complete! (100%)")
+                    time.sleep(1)  # Show "Complete!" for a moment
                 
                 finally:
                     # Clean up temporary files
                     cleanup_temp_files(page_paths)
-                    status_text.text("✅ Processing complete!")
-                    progress_bar.progress(1.0)
+                    progress_bar.empty()
             
             # Display results if available
             if st.session_state.merged_json:
