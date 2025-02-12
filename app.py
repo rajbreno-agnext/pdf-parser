@@ -89,7 +89,37 @@ async def process_page(page_path, model, page_num, progress_bar, status_text):
         gemini_file = genai.upload_file(page_path, mime_type="application/pdf")
         
         # Create base prompt
-        base_prompt = "Parse this PDF page into structured JSON format. Include all relevant information."
+        base_prompt = """Parse this PDF page into structured JSON format. Follow these strict guidelines:
+
+1. Handling Merged Cells:
+   - If a cell value (especially in method column) appears to span multiple rows, repeat that value for all affected rows
+   - Look for visual cues like merged cell borders or aligned values
+   - When a value like 'EL/SOP/520' appears once for multiple rows, copy it to all related rows
+   - Pay special attention to method/procedure columns where values often apply to multiple rows
+
+2. Data Extraction Rules:
+   - Extract all text values accurately
+   - Maintain relationships between columns
+   - Preserve all numerical values and units
+   - Keep special characters and formatting
+   - Include all relevant information
+
+3. Output Format:
+   - Return valid JSON that can be parsed
+   - Use consistent data types
+   - Ensure all rows have complete data
+   - Fill in repeated values where appropriate
+
+Example of handling merged cells:
+If you see:
+Row 1: Method: EL/SOP/520, Parameter: X
+Row 2: Method: (empty), Parameter: Y
+Row 3: Method: (empty), Parameter: Z
+
+Output should be:
+Row 1: Method: EL/SOP/520, Parameter: X
+Row 2: Method: EL/SOP/520, Parameter: Y
+Row 3: Method: EL/SOP/520, Parameter: Z"""
         
         # Add custom instructions if provided
         if st.session_state.custom_prompt:
@@ -229,6 +259,25 @@ async def post_merge_validation(merged_json, model):
         json_str = json.dumps(merged_json, indent=2)
         print("\n[DEBUG] Starting post-merge validation")
         
+        # Get user-defined columns from session state
+        user_columns = []
+        if 'column_names' in st.session_state and st.session_state.column_names:
+            user_columns = [col.strip() for col in st.session_state.column_names.split('\n') if col.strip()]
+        
+        # If no columns defined, use default ones
+        if not user_columns:
+            user_columns = [
+                "parameter",
+                "result",
+                "method",
+                "prescribed_standard"
+            ]
+        
+        # Create example row with user-defined columns
+        example_row = {}
+        for col in user_columns:
+            example_row[col] = f"Example {col} value"
+        
         # Create prompt for post-merge validation
         prompt = f"""
         Analyze and optimize this JSON structure by consolidating similar tables and removing insignificant data.
@@ -237,7 +286,7 @@ async def post_merge_validation(merged_json, model):
         1. Table Consolidation Rules:
            - Combine tables with similar names or purposes into a single table
            - Merge tables that share similar column structures
-           - Remove redundant "Sr No" or "S.No" columns and add a new sequential numbering
+           - Remove redundant "Sr No" or "S.No" columns
            - Keep unique identifiers and test parameters intact
 
         2. Table Quality and Filtering Rules:
@@ -258,20 +307,25 @@ async def post_merge_validation(merged_json, model):
         4. Data Structure Requirements:
            - Maintain data integrity during consolidation
            - Ensure consistent column naming across merged tables
-           - Add a new "sequence_number" column starting from 0 for each table
            - Remove any duplicate entries
            - Standardize date formats and numerical values
            - Ensure all retained tables have proper headers and consistent data types
-           - For merged tables, ensure sequence numbers are continuous starting from 0
+           - STRICTLY use only these columns in the exact order:
+             {', '.join(user_columns)}
 
-        5. Return the optimized data in this exact format:
+        5. Method Column Validation:
+           - If a method value (like 'EL/SOP/520') appears followed by empty method cells, copy the value to those empty cells
+           - Look for patterns where the same method applies to consecutive rows
+           - Fill in missing method values based on context and surrounding rows
+           - Ensure method values are consistent within related parameter groups
+
+        6. Return the optimized data in this exact format:
         {{
             "data": [
                 {{
                     "table": "Consolidated Table Name",
                     "rows": [
-                        {{"sequence_number": 0, "parameter": "value1", "result": "value2", ...}},
-                        {{"sequence_number": 1, "parameter": "value3", "result": "value4", ...}}
+                        {json.dumps(example_row, indent=12)}
                     ]
                 }}
             ]
@@ -282,9 +336,11 @@ async def post_merge_validation(merged_json, model):
         - Ensure each table has sufficient rows to justify its existence
         - Merge similar tables to create more comprehensive datasets
         - Remove or merge tables that contain redundant or sparse information
-        - All sequence numbers must start from 0 and be continuous
         - Remove any row where only the first column contains data
         - Ensure no empty or header-only rows remain in the final output
+        - STRICTLY maintain the specified column order in all rows
+        - If a column from the required list is missing in the data, include it with null or appropriate default value
+        - Do not include any columns that are not in the specified list
 
         Input JSON to optimize:
         {json_str}
@@ -304,9 +360,41 @@ async def post_merge_validation(merged_json, model):
             if "```json" in json_text and "```" in json_text:
                 json_text = json_text.split("```json")[1].split("```")[0].strip()
             
-            # Parse and return the optimized JSON
+            # Parse the optimized JSON
             optimized_json = json.loads(json_text)
-            print("[DEBUG] Successfully parsed optimized JSON")
+            
+            # Additional backup validation for method values
+            if isinstance(optimized_json, dict) and 'data' in optimized_json:
+                for table in optimized_json['data']:
+                    rows = table.get('rows', [])
+                    if rows:
+                        # Find method column index if it exists
+                        method_col = next((col for col in user_columns if col.lower() == 'method'), None)
+                        if method_col:
+                            last_method = None
+                            method_group = []
+                            
+                            # First pass: collect method groups
+                            for i, row in enumerate(rows):
+                                current_method = row.get(method_col)
+                                if current_method and current_method.strip():
+                                    # If we have a method group and found a new method, process the group
+                                    if method_group and last_method:
+                                        for group_row in method_group:
+                                            group_row[method_col] = last_method
+                                        method_group = []
+                                    last_method = current_method
+                                    method_group = []
+                                else:
+                                    if last_method:
+                                        method_group.append(row)
+                            
+                            # Process last group if exists
+                            if method_group and last_method:
+                                for group_row in method_group:
+                                    group_row[method_col] = last_method
+            
+            print("[DEBUG] Successfully parsed and validated optimized JSON")
             return optimized_json
         except Exception as e:
             print(f"[DEBUG] Error parsing optimized JSON: {str(e)}")
@@ -387,8 +475,8 @@ async def merge_with_gemini(results, model):
                 {{
                     "table": "Consolidated Table Name",
                     "rows": [
-                        {{"column1": "value1", "column2": "value2", ...}},
-                        {{"column1": "value3", "column2": "value4", ...}}
+                        {{"parameter": "value1", "result": "value2", ...}},
+                        {{"parameter": "value3", "result": "value4", ...}}
                     ]
                 }}
             ]
@@ -868,31 +956,70 @@ def main():
             with col3:
                 if st.button("🗑️", key="clear_api_key", help="Clear API Key"):
                     if clear_settings(clear_api=True):
-                        st.success("API Key cleared!")
                         st.rerun()
 
-    # Custom prompt input section without expander
-    container = st.container()
-    with container:
-        col1, col2, col3 = st.columns([18, 1, 1])
-        with col1:
-            custom_prompt = st.text_area(
-                "Additional Instructions",
-                value=st.session_state.custom_prompt,
-                placeholder="Enter any specific instructions for parsing (optional)",
-                label_visibility="collapsed"
-            )
-        with col2:
-            if st.button("✓", key="apply_instructions", help="Apply Instructions"):
-                st.session_state.custom_prompt = custom_prompt
-                save_settings(
-                    api_key=st.session_state.api_key,
-                    custom_prompt=custom_prompt
+    # Input & Output Format section with expander
+    with st.expander("⚙️ Input & Output Format"):
+        # Extraction Instructions
+        container = st.container()
+        with container:
+            col1, col2, col3 = st.columns([18, 1, 1])
+            with col1:
+                # Initialize custom_prompt with default value if not present
+                if 'custom_prompt' not in st.session_state:
+                    st.session_state.custom_prompt = "extract test report table only"
+                
+                custom_prompt = st.text_area(
+                    "Extraction Instructions",
+                    value=st.session_state.custom_prompt,
+                    height=150
                 )
-        with col3:
-            if st.button("🗑️", key="clear_instructions", help="Clear Instructions"):
-                if clear_settings(clear_prompt=True):
-                    st.success("Instructions cleared!")
+            with col2:
+                if st.button("✓", key="apply_instructions", help="Apply Instructions"):
+                    st.session_state.custom_prompt = custom_prompt
+                    save_settings(
+                        api_key=st.session_state.api_key,
+                        custom_prompt=custom_prompt
+                    )
+            with col3:
+                if st.button("🗑️", key="clear_instructions", help="Clear Instructions"):
+                    if clear_settings(clear_prompt=True):
+                        st.rerun()
+        
+        st.markdown("<br>", unsafe_allow_html=True)  # Add some spacing
+        
+        # Column names input (Mandatory)
+        container = st.container()
+        with container:
+            col1, col2, col3 = st.columns([18, 1, 1])
+            with col1:
+                # Initialize column_names with default value if not present
+                if 'column_names' not in st.session_state:
+                    st.session_state.column_names = "parameter\nmethod\nrequirement\nresult"
+                
+                column_names = st.text_area(
+                    "Define Output Columns *",
+                    value=st.session_state.column_names,
+                    height=150
+                )
+            with col2:
+                if st.button("✓", key="apply_columns", help="Apply Column Names"):
+                    if column_names.strip():
+                        st.session_state.column_names = '\n'.join(
+                            line.strip() for line in column_names.split('\n') 
+                            if line.strip()
+                        )
+                        save_settings(
+                            api_key=st.session_state.api_key,
+                            custom_prompt=st.session_state.custom_prompt
+                        )
+            with col3:
+                if st.button("🗑️", key="clear_columns", help="Clear Column Names"):
+                    st.session_state.column_names = ''
+                    save_settings(
+                        api_key=st.session_state.api_key,
+                        custom_prompt=st.session_state.custom_prompt
+                    )
                     st.rerun()
 
     # Add checkbox for multi-sheet option before file upload
